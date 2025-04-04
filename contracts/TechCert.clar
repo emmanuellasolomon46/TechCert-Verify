@@ -235,3 +235,178 @@
         )
     )
 )
+
+
+
+;; Define constants
+(define-constant err-invalid-rating (err u108))
+(define-constant err-already-rated (err u109))
+
+;; Define rating map
+(define-map certification-ratings
+    { cert-id: uint }
+    { total-score: uint, num-ratings: uint }
+)
+
+;; Define user ratings map to prevent multiple ratings
+(define-map user-ratings
+    { cert-id: uint, rater: principal }
+    bool
+)
+
+;; Add rating function
+(define-public (rate-certification (cert-id uint) (score uint))
+    (let (
+        (current-rating (default-to { total-score: u0, num-ratings: u0 } 
+                        (map-get? certification-ratings { cert-id: cert-id })))
+        (has-rated (default-to false 
+                   (map-get? user-ratings { cert-id: cert-id, rater: tx-sender })))
+    )
+    (begin
+        (asserts! (is-some (get-certification cert-id)) err-cert-not-found)
+        (asserts! (and (>= score u1) (<= score u5)) err-invalid-rating)
+        (asserts! (not has-rated) err-already-rated)
+        (map-set user-ratings { cert-id: cert-id, rater: tx-sender } true)
+        (ok (map-set certification-ratings
+            { cert-id: cert-id }
+            {
+                total-score: (+ (get total-score current-rating) score),
+                num-ratings: (+ (get num-ratings current-rating) u1)
+            }))
+    ))
+)
+
+
+;; Define verification history map
+(define-map verification-history
+    { cert-id: uint }
+    (list 50 { verifier: principal, timestamp: uint })
+)
+
+;; Add verification tracking
+(define-public (track-verification (cert-id uint))
+    (let (
+        (current-history (default-to (list) 
+                         (map-get? verification-history { cert-id: cert-id })))
+    )
+    (begin
+        (asserts! (is-some (get-certification cert-id)) err-cert-not-found)
+        (ok (map-set verification-history
+            { cert-id: cert-id }
+            (unwrap-panic (as-max-len? 
+                (append current-history { verifier: tx-sender, timestamp: stacks-block-height })
+                u50))))
+    ))
+)
+
+
+;; Define milestone map
+(define-map certification-milestones
+    principal
+    { certs-count: uint, last-milestone: uint }
+)
+
+(define-constant milestone-levels (list u5 u10 u20 u50))
+
+;; Update milestones when certification is issued
+(define-public (check-milestones (user principal))
+    (let (
+        (user-certs (default-to (list) (map-get? user-certifications user)))
+        (current-milestones (default-to { certs-count: u0, last-milestone: u0 }
+                            (map-get? certification-milestones user)))
+    )
+    (begin
+        (map-set certification-milestones
+            user
+            {
+                certs-count: (len user-certs),
+                last-milestone: (len user-certs)
+            })
+        (ok true)
+    ))
+)
+
+
+;; Define achievement tracking map
+(define-map time-achievements
+    principal
+    { first-cert-date: uint, achievement-level: uint }
+)
+
+;; Track time-based achievements
+(define-public (update-time-achievements (user principal))
+    (let (
+        (current-achievements (default-to { first-cert-date: stacks-block-height, achievement-level: u0 }
+                             (map-get? time-achievements user)))
+    )
+    (begin
+        (map-set time-achievements
+            user
+            {
+                first-cert-date: (get first-cert-date current-achievements),
+                achievement-level: (+ (get achievement-level current-achievements) u1)
+            })
+        (ok true)
+    ))
+)
+
+;; Define specialization map
+(define-map user-specializations
+    principal
+    { primary: (string-ascii 30), secondary: (string-ascii 30) }
+)
+
+;; Set user specialization
+(define-public (set-specialization (primary (string-ascii 30)) (secondary (string-ascii 30)))
+    (ok (map-set user-specializations
+        tx-sender
+        { primary: primary, secondary: secondary }))
+)
+
+;; Define constants
+(define-constant err-invalid-challenge (err u110))
+
+;; Define challenge map
+(define-map certification-challenges
+    { cert-id: uint }
+    { challenger: principal, reason: (string-ascii 200), status: (string-ascii 20) }
+)
+
+;; Submit certification challenge
+(define-public (challenge-certification (cert-id uint) (reason (string-ascii 200)))
+    (begin
+        (asserts! (is-some (get-certification cert-id)) err-cert-not-found)
+        (asserts! (is-none (map-get? certification-challenges { cert-id: cert-id })) 
+                 err-invalid-challenge)
+        (ok (map-set certification-challenges
+            { cert-id: cert-id }
+            { challenger: tx-sender, reason: reason, status: "pending" }))
+    )
+)
+
+
+;; Define notification map
+(define-map expiry-notifications
+    { cert-id: uint }
+    { notified: bool, notification-date: uint }
+)
+
+;; Check and set notification status
+(define-public (check-expiry-notification (cert-id uint))
+    (let (
+        (cert (get-certification cert-id))
+        (current-notification (default-to { notified: false, notification-date: u0 }
+                             (map-get? expiry-notifications { cert-id: cert-id })))
+    )
+    (begin
+        (asserts! (is-some cert) err-cert-not-found)
+        (ok (map-set expiry-notifications
+            { cert-id: cert-id }
+            {
+                notified: true,
+                notification-date: stacks-block-height
+            }))
+    ))
+)
+
+
