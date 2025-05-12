@@ -410,3 +410,97 @@
 )
 
 
+(define-constant err-invalid-batch (err u111))
+(define-constant max-batch-size u10)
+
+(define-public (batch-issue-certifications 
+    (cert-ids (list 10 uint))
+    (holders (list 10 principal))
+    (cert-names (list 10 (string-ascii 50)))
+    (expiry-dates (list 10 uint)))
+    
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (asserts! (> (len cert-ids) u0) err-invalid-batch)
+        (asserts! (is-eq (len cert-ids) (len holders)) err-invalid-batch)
+        (asserts! (is-eq (len cert-ids) (len cert-names)) err-invalid-batch)
+        (asserts! (is-eq (len cert-ids) (len expiry-dates)) err-invalid-batch)
+        
+        (ok (map issue-certification-internal 
+            cert-ids
+            holders 
+            cert-names
+            expiry-dates))
+    )
+)
+
+(define-private (issue-certification-internal 
+    (cert-id uint)
+    (holder principal)
+    (cert-name (string-ascii 50))
+    (expiry-date uint))
+    
+    (map-set certifications
+        { cert-id: cert-id }
+        {
+            holder: holder,
+            issuer: tx-sender,
+            cert-name: cert-name,
+            issue-date: stacks-block-height,
+            expiry-date: expiry-date,
+            status: "active"
+        }
+    )
+)
+
+
+(define-constant err-template-exists (err u112))
+(define-constant err-template-not-found (err u113))
+
+(define-map certification-templates
+    { template-id: uint }
+    {
+        name: (string-ascii 50),
+        validity-period: uint,
+        category: (string-ascii 30),
+        required-prerequisites: (list 5 uint)
+    }
+)
+
+(define-public (create-certification-template
+    (template-id uint)
+    (name (string-ascii 50))
+    (validity-period uint)
+    (category (string-ascii 30))
+    (prerequisites (list 5 uint)))
+    
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (asserts! (is-none (map-get? certification-templates {template-id: template-id})) err-template-exists)
+        
+        (ok (map-set certification-templates
+            {template-id: template-id}
+            {
+                name: name,
+                validity-period: validity-period,
+                category: category,
+                required-prerequisites: prerequisites
+            }))
+    )
+)
+
+(define-public (issue-from-template 
+    (template-id uint)
+    (cert-id uint)
+    (holder principal))
+    
+    (let ((template (unwrap! (map-get? certification-templates {template-id: template-id}) err-template-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+            (issue-certification cert-id 
+                               holder 
+                               (get name template)
+                               (+ stacks-block-height (get validity-period template)))
+        )
+    )
+)
