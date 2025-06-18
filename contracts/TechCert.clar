@@ -8,6 +8,59 @@
 (define-constant err-max-endorsements-reached (err u103))
 (define-constant  err-already-endorsed (err u104))
 
+(define-constant err-service-exists (err u200))
+(define-constant err-service-not-found (err u201))
+(define-constant err-insufficient-payment (err u202))
+(define-constant err-booking-exists (err u203))
+(define-constant err-booking-not-found (err u204))
+(define-constant err-invalid-service-status (err u205))
+(define-constant err-unauthorized-action (err u206))
+
+(define-map marketplace-services
+    { service-id: uint }
+    {
+        provider: principal,
+        cert-id: uint,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        price-per-hour: uint,
+        service-type: (string-ascii 20),
+        status: (string-ascii 10),
+        created-at: uint
+    }
+)
+
+(define-map service-bookings
+    { booking-id: uint }
+    {
+        service-id: uint,
+        client: principal,
+        provider: principal,
+        hours-booked: uint,
+        total-amount: uint,
+        booking-status: (string-ascii 15),
+        booking-date: uint,
+        completion-date: (optional uint)
+    }
+)
+
+(define-map provider-earnings
+    principal
+    { total-earned: uint, completed-services: uint }
+)
+
+(define-map service-reviews
+    { booking-id: uint }
+    {
+        reviewer: principal,
+        rating: uint,
+        review-text: (string-ascii 300),
+        review-date: uint
+    }
+)
+
+(define-data-var next-service-id uint u1)
+(define-data-var next-booking-id uint u1)
 ;; Data Maps
 (define-map certifications
     { cert-id: uint }
@@ -503,4 +556,164 @@
                                (+ stacks-block-height (get validity-period template)))
         )
     )
+)
+
+
+(define-public (create-marketplace-service
+    (cert-id uint)
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (price-per-hour uint)
+    (service-type (string-ascii 20)))
+    
+    (let ((service-id (var-get next-service-id))
+          (cert (get-certification cert-id)))
+        (begin
+            (asserts! (is-some cert) err-cert-not-found)
+            (asserts! (is-eq (get holder (unwrap-panic cert)) tx-sender) err-not-authorized)
+            (asserts! (is-eq (get status (unwrap-panic cert)) "active") err-invalid-service-status)
+            (asserts! (is-none (map-get? marketplace-services {service-id: service-id})) err-service-exists)
+            
+            (map-set marketplace-services
+                {service-id: service-id}
+                {
+                    provider: tx-sender,
+                    cert-id: cert-id,
+                    title: title,
+                    description: description,
+                    price-per-hour: price-per-hour,
+                    service-type: service-type,
+                    status: "active",
+                    created-at: stacks-block-height
+                })
+            
+            (var-set next-service-id (+ service-id u1))
+            (ok service-id)
+        )
+    )
+)
+
+(define-public (book-service
+    (service-id uint)
+    (hours-requested uint))
+    
+    (let ((service (unwrap! (map-get? marketplace-services {service-id: service-id}) err-service-not-found))
+          (booking-id (var-get next-booking-id))
+          (total-cost (* (get price-per-hour service) hours-requested)))
+        (begin
+            (asserts! (is-eq (get status service) "active") err-invalid-service-status)
+            (asserts! (> hours-requested u0) err-invalid-service-status)
+            (asserts! (not (is-eq tx-sender (get provider service))) err-unauthorized-action)
+            
+            (try! (stx-transfer? total-cost tx-sender (get provider service)))
+            
+            (map-set service-bookings
+                {booking-id: booking-id}
+                {
+                    service-id: service-id,
+                    client: tx-sender,
+                    provider: (get provider service),
+                    hours-booked: hours-requested,
+                    total-amount: total-cost,
+                    booking-status: "confirmed",
+                    booking-date: stacks-block-height,
+                    completion-date: none
+                })
+            
+            (var-set next-booking-id (+ booking-id u1))
+            (ok booking-id)
+        )
+    )
+)
+
+(define-public (complete-service (booking-id uint))
+    (let ((booking (unwrap! (map-get? service-bookings {booking-id: booking-id}) err-booking-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get provider booking)) err-unauthorized-action)
+            (asserts! (is-eq (get booking-status booking) "confirmed") err-invalid-service-status)
+            
+            (map-set service-bookings
+                {booking-id: booking-id}
+                (merge booking {
+                    booking-status: "completed",
+                    completion-date: (some stacks-block-height)
+                }))
+            
+            (let ((current-earnings (default-to {total-earned: u0, completed-services: u0}
+                                               (map-get? provider-earnings tx-sender))))
+                (map-set provider-earnings
+                    tx-sender
+                    {
+                        total-earned: (+ (get total-earned current-earnings) (get total-amount booking)),
+                        completed-services: (+ (get completed-services current-earnings) u1)
+                    }))
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (review-service
+    (booking-id uint)
+    (rating uint)
+    (review-text (string-ascii 300)))
+    
+    (let ((booking (unwrap! (map-get? service-bookings {booking-id: booking-id}) err-booking-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get client booking)) err-unauthorized-action)
+            (asserts! (is-eq (get booking-status booking) "completed") err-invalid-service-status)
+            (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+            (asserts! (is-none (map-get? service-reviews {booking-id: booking-id})) err-already-rated)
+            
+            (map-set service-reviews
+                {booking-id: booking-id}
+                {
+                    reviewer: tx-sender,
+                    rating: rating,
+                    review-text: review-text,
+                    review-date: stacks-block-height
+                })
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-service-status (service-id uint) (new-status (string-ascii 10)))
+    (let ((service (unwrap! (map-get? marketplace-services {service-id: service-id}) err-service-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get provider service)) err-unauthorized-action)
+            
+            (map-set marketplace-services
+                {service-id: service-id}
+                (merge service {status: new-status}))
+            
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-marketplace-service (service-id uint))
+    (map-get? marketplace-services {service-id: service-id})
+)
+
+(define-read-only (get-service-booking (booking-id uint))
+    (map-get? service-bookings {booking-id: booking-id})
+)
+
+(define-read-only (get-provider-earnings (provider principal))
+    (default-to {total-earned: u0, completed-services: u0}
+                (map-get? provider-earnings provider))
+)
+
+(define-read-only (get-service-review (booking-id uint))
+    (map-get? service-reviews {booking-id: booking-id})
+)
+
+(define-read-only (get-next-service-id)
+    (var-get next-service-id)
+)
+
+(define-read-only (get-next-booking-id)
+    (var-get next-booking-id)
 )
