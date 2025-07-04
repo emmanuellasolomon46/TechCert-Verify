@@ -16,6 +16,36 @@
 (define-constant err-invalid-service-status (err u205))
 (define-constant err-unauthorized-action (err u206))
 
+
+(define-constant err-escrow-exists (err u300))
+(define-constant err-escrow-not-found (err u301))
+(define-constant err-insufficient-escrow (err u302))
+(define-constant err-escrow-already-released (err u303))
+(define-constant err-invalid-escrow-status (err u304))
+(define-constant err-escrow-not-disputed (err u305))
+(define-constant err-unauthorized-escrow-action (err u306))
+
+(define-data-var next-escrow-id uint u1)
+
+(define-map escrow-agreements
+    { escrow-id: uint }
+    {
+        service-id: uint,
+        client: principal,
+        provider: principal,
+        amount: uint,
+        status: (string-ascii 15),
+        created-at: uint,
+        deadline: uint,
+        dispute-reason: (optional (string-ascii 200))
+    }
+)
+
+(define-map escrow-balances
+    { escrow-id: uint }
+    { locked-amount: uint }
+)
+
 (define-map marketplace-services
     { service-id: uint }
     {
@@ -591,6 +621,143 @@
             (ok service-id)
         )
     )
+)
+
+
+(define-public (create-escrow
+    (service-id uint)
+    (provider principal)
+    (amount uint)
+    (deadline uint))
+    
+    (let ((escrow-id (var-get next-escrow-id))
+          (service (unwrap! (map-get? marketplace-services {service-id: service-id}) err-service-not-found)))
+        (begin
+            (asserts! (is-eq (get provider service) provider) err-unauthorized-action)
+            (asserts! (> amount u0) err-insufficient-payment)
+            (asserts! (> deadline stacks-block-height) err-invalid-service-status)
+            
+            (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+            
+            (map-set escrow-agreements
+                {escrow-id: escrow-id}
+                {
+                    service-id: service-id,
+                    client: tx-sender,
+                    provider: provider,
+                    amount: amount,
+                    status: "active",
+                    created-at: stacks-block-height,
+                    deadline: deadline,
+                    dispute-reason: none
+                })
+            
+            (map-set escrow-balances
+                {escrow-id: escrow-id}
+                {locked-amount: amount})
+            
+            (var-set next-escrow-id (+ escrow-id u1))
+            (ok escrow-id)
+        )
+    )
+)
+
+(define-public (release-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements {escrow-id: escrow-id}) err-escrow-not-found))
+          (balance (unwrap! (map-get? escrow-balances {escrow-id: escrow-id}) err-escrow-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized-escrow-action)
+            (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+            
+            (try! (as-contract (stx-transfer? (get locked-amount balance) tx-sender (get provider escrow))))
+            
+            (map-set escrow-agreements
+                {escrow-id: escrow-id}
+                (merge escrow {status: "released"}))
+            
+            (map-set escrow-balances
+                {escrow-id: escrow-id}
+                {locked-amount: u0})
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (dispute-escrow (escrow-id uint) (reason (string-ascii 200)))
+    (let ((escrow (unwrap! (map-get? escrow-agreements {escrow-id: escrow-id}) err-escrow-not-found)))
+        (begin
+            (asserts! (or (is-eq tx-sender (get client escrow)) (is-eq tx-sender (get provider escrow))) err-unauthorized-escrow-action)
+            (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+            
+            (map-set escrow-agreements
+                {escrow-id: escrow-id}
+                (merge escrow {
+                    status: "disputed",
+                    dispute-reason: (some reason)
+                }))
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-dispute (escrow-id uint) (release-to-provider bool))
+    (let ((escrow (unwrap! (map-get? escrow-agreements {escrow-id: escrow-id}) err-escrow-not-found))
+          (balance (unwrap! (map-get? escrow-balances {escrow-id: escrow-id}) err-escrow-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+            (asserts! (is-eq (get status escrow) "disputed") err-escrow-not-disputed)
+            
+            (let ((recipient (if release-to-provider (get provider escrow) (get client escrow))))
+                (try! (as-contract (stx-transfer? (get locked-amount balance) tx-sender recipient)))
+                
+                (map-set escrow-agreements
+                    {escrow-id: escrow-id}
+                    (merge escrow {status: "resolved"}))
+                
+                (map-set escrow-balances
+                    {escrow-id: escrow-id}
+                    {locked-amount: u0})
+                
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (refund-expired-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements {escrow-id: escrow-id}) err-escrow-not-found))
+          (balance (unwrap! (map-get? escrow-balances {escrow-id: escrow-id}) err-escrow-not-found)))
+        (begin
+            (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+            (asserts! (> stacks-block-height (get deadline escrow)) err-invalid-escrow-status)
+            
+            (try! (as-contract (stx-transfer? (get locked-amount balance) tx-sender (get client escrow))))
+            
+            (map-set escrow-agreements
+                {escrow-id: escrow-id}
+                (merge escrow {status: "refunded"}))
+            
+            (map-set escrow-balances
+                {escrow-id: escrow-id}
+                {locked-amount: u0})
+            
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-escrow-agreement (escrow-id uint))
+    (map-get? escrow-agreements {escrow-id: escrow-id})
+)
+
+(define-read-only (get-escrow-balance (escrow-id uint))
+    (map-get? escrow-balances {escrow-id: escrow-id})
+)
+
+(define-read-only (get-next-escrow-id)
+    (var-get next-escrow-id)
 )
 
 (define-public (book-service
