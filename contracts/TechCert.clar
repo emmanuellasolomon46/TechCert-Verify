@@ -884,3 +884,268 @@
 (define-read-only (get-next-booking-id)
     (var-get next-booking-id)
 )
+
+;; === CERTIFICATION LEARNING PATH SYSTEM ===
+
+;; Learning path error constants
+(define-constant err-path-exists (err u400))
+(define-constant err-path-not-found (err u401))
+(define-constant err-already-enrolled (err u402))
+(define-constant err-not-enrolled (err u403))
+(define-constant err-invalid-step (err u404))
+(define-constant err-path-full (err u405))
+(define-constant err-prerequisites-missing (err u406))
+
+;; Learning path data variables
+(define-data-var next-path-id uint u1)
+
+;; Learning path structure with steps and metadata
+(define-map learning-paths
+    { path-id: uint }
+    {
+        creator: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        difficulty-level: uint,
+        estimated-hours: uint,
+        max-enrollees: uint,
+        current-enrollees: uint,
+        created-at: uint,
+        status: (string-ascii 15)
+    }
+)
+
+;; Path steps defining the certification sequence
+(define-map path-steps
+    { path-id: uint, step-number: uint }
+    {
+        required-cert-id: uint,
+        step-title: (string-ascii 80),
+        estimated-completion-time: uint,
+        is-optional: bool
+    }
+)
+
+;; User enrollment in learning paths
+(define-map user-path-enrollments
+    { user: principal, path-id: uint }
+    {
+        enrolled-at: uint,
+        current-step: uint,
+        completed-steps: uint,
+        completion-percentage: uint,
+        last-activity: uint
+    }
+)
+
+;; Track completed steps for users
+(define-map user-step-completions
+    { user: principal, path-id: uint, step-number: uint }
+    {
+        completed-at: uint,
+        cert-earned: uint
+    }
+)
+
+;; Path completion rewards
+(define-map path-completion-rewards
+    { path-id: uint }
+    {
+        reward-points: uint,
+        completion-badge: (string-ascii 50),
+        unlock-paths: (list 5 uint)
+    }
+)
+
+;; Create new learning path with initial configuration
+(define-public (create-learning-path
+    (title (string-ascii 100))
+    (description (string-ascii 300))
+    (difficulty-level uint)
+    (estimated-hours uint)
+    (max-enrollees uint))
+    
+    (let ((path-id (var-get next-path-id)))
+        (begin
+            ;; Validate input parameters
+            (asserts! (> (len title) u0) err-invalid-batch)
+            (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) err-invalid-rating)
+            (asserts! (> estimated-hours u0) err-invalid-batch)
+            (asserts! (> max-enrollees u0) err-invalid-batch)
+            
+            ;; Create the learning path
+            (map-set learning-paths
+                { path-id: path-id }
+                {
+                    creator: tx-sender,
+                    title: title,
+                    description: description,
+                    difficulty-level: difficulty-level,
+                    estimated-hours: estimated-hours,
+                    max-enrollees: max-enrollees,
+                    current-enrollees: u0,
+                    created-at: stacks-block-height,
+                    status: "active"
+                })
+            
+            (var-set next-path-id (+ path-id u1))
+            (ok path-id)
+        )
+    )
+)
+
+;; Add step to existing learning path
+(define-public (add-path-step
+    (path-id uint)
+    (step-number uint)
+    (required-cert-id uint)
+    (step-title (string-ascii 80))
+    (estimated-completion-time uint)
+    (is-optional bool))
+    
+    (let ((path (unwrap! (map-get? learning-paths { path-id: path-id }) err-path-not-found)))
+        (begin
+            ;; Only path creator can add steps
+            (asserts! (is-eq tx-sender (get creator path)) err-not-authorized)
+            (asserts! (is-eq (get status path) "active") err-invalid-service-status)
+            
+            ;; Validate the required certification exists
+            (asserts! (is-some (get-certification required-cert-id)) err-cert-not-found)
+            
+            ;; Add the step
+            (map-set path-steps
+                { path-id: path-id, step-number: step-number }
+                {
+                    required-cert-id: required-cert-id,
+                    step-title: step-title,
+                    estimated-completion-time: estimated-completion-time,
+                    is-optional: is-optional
+                })
+            
+            (ok true)
+        )
+    )
+)
+
+;; User enrolls in a learning path
+(define-public (enroll-in-path (path-id uint))
+    (let ((path (unwrap! (map-get? learning-paths { path-id: path-id }) err-path-not-found)))
+        (begin
+            ;; Check if user is already enrolled
+            (asserts! (is-none (map-get? user-path-enrollments { user: tx-sender, path-id: path-id })) err-already-enrolled)
+            
+            ;; Check path capacity
+            (asserts! (< (get current-enrollees path) (get max-enrollees path)) err-path-full)
+            (asserts! (is-eq (get status path) "active") err-invalid-service-status)
+            
+            ;; Enroll user
+            (map-set user-path-enrollments
+                { user: tx-sender, path-id: path-id }
+                {
+                    enrolled-at: stacks-block-height,
+                    current-step: u1,
+                    completed-steps: u0,
+                    completion-percentage: u0,
+                    last-activity: stacks-block-height
+                })
+            
+            ;; Update path enrollment count
+            (map-set learning-paths
+                { path-id: path-id }
+                (merge path { current-enrollees: (+ (get current-enrollees path) u1) }))
+            
+            (ok true)
+        )
+    )
+)
+
+;; Mark step as completed for user
+(define-public (complete-path-step (path-id uint) (step-number uint) (cert-id uint))
+    (let ((enrollment (unwrap! (map-get? user-path-enrollments { user: tx-sender, path-id: path-id }) err-not-enrolled))
+          (step (unwrap! (map-get? path-steps { path-id: path-id, step-number: step-number }) err-invalid-step))
+          (user-cert (get-certification cert-id)))
+        (begin
+            ;; Verify user has the required certification
+            (asserts! (is-some user-cert) err-cert-not-found)
+            (asserts! (is-eq (get holder (unwrap-panic user-cert)) tx-sender) err-not-authorized)
+            (asserts! (is-eq (get required-cert-id step) cert-id) err-invalid-step)
+            
+            ;; Record step completion
+            (map-set user-step-completions
+                { user: tx-sender, path-id: path-id, step-number: step-number }
+                {
+                    completed-at: stacks-block-height,
+                    cert-earned: cert-id
+                })
+            
+            ;; Update user enrollment progress
+            (let ((new-completed-steps (+ (get completed-steps enrollment) u1)))
+                (map-set user-path-enrollments
+                    { user: tx-sender, path-id: path-id }
+                    (merge enrollment {
+                        completed-steps: new-completed-steps,
+                        completion-percentage: (* new-completed-steps u10),
+                        last-activity: stacks-block-height,
+                        current-step: (+ step-number u1)
+                    })))
+            
+            (ok true)
+        )
+    )
+)
+
+;; Set completion rewards for a learning path
+(define-public (set-path-rewards
+    (path-id uint)
+    (reward-points uint)
+    (completion-badge (string-ascii 50))
+    (unlock-paths (list 5 uint)))
+    
+    (let ((path (unwrap! (map-get? learning-paths { path-id: path-id }) err-path-not-found)))
+        (begin
+            ;; Only path creator or contract owner can set rewards
+            (asserts! (or (is-eq tx-sender (get creator path)) (is-eq tx-sender contract-owner)) err-not-authorized)
+            
+            (map-set path-completion-rewards
+                { path-id: path-id }
+                {
+                    reward-points: reward-points,
+                    completion-badge: completion-badge,
+                    unlock-paths: unlock-paths
+                })
+            
+            (ok true)
+        )
+    )
+)
+
+;; Get learning path details
+(define-read-only (get-learning-path (path-id uint))
+    (map-get? learning-paths { path-id: path-id })
+)
+
+;; Get path step information
+(define-read-only (get-path-step (path-id uint) (step-number uint))
+    (map-get? path-steps { path-id: path-id, step-number: step-number })
+)
+
+;; Get user's enrollment status in a path
+(define-read-only (get-user-enrollment (user principal) (path-id uint))
+    (map-get? user-path-enrollments { user: user, path-id: path-id })
+)
+
+;; Get user's step completion record
+(define-read-only (get-step-completion (user principal) (path-id uint) (step-number uint))
+    (map-get? user-step-completions { user: user, path-id: path-id, step-number: step-number })
+)
+
+;; Get path completion rewards
+(define-read-only (get-path-rewards (path-id uint))
+    (map-get? path-completion-rewards { path-id: path-id })
+)
+
+;; Get next available path ID
+(define-read-only (get-next-path-id)
+    (var-get next-path-id)
+)
+
