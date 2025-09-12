@@ -9,6 +9,14 @@ requirements = []
 path = 'contracts/TechCert.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.cert-portfolio]
+path = 'contracts/cert-portfolio.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.cert-mentorship]
+path = 'contracts/cert-mentorship.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
